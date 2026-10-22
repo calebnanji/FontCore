@@ -33,6 +33,7 @@ impl FontFormat {
         }
     }
 
+    /// The file extension FontCore stores this format under, without the dot.
     pub fn extension(self) -> &'static str {
         match self {
             Self::Ttf => "ttf",

@@ -49,6 +49,7 @@ impl License {
         })
     }
 
+    /// A free-text license, stored as `{"custom": text}`.
     pub fn custom(text: impl Into<String>) -> Self {
         Self::Custom(CustomLicense {
             custom: text.into(),

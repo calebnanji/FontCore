@@ -19,6 +19,7 @@ pub struct Timestamp {
 }
 
 impl Timestamp {
+    /// The current time in UTC, in whole seconds.
     pub fn now() -> Self {
         let secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -39,6 +40,7 @@ impl Timestamp {
         Self { text, unix: secs }
     }
 
+    /// Parses a strict RFC 3339 date-time, keeping `text` exactly as written.
     pub fn parse(text: &str) -> Result<Self> {
         parse_unix(text)
             .map(|unix| Self {
@@ -48,6 +50,7 @@ impl Timestamp {
             .ok_or_else(|| Error::InvalidTimestamp(text.to_owned()))
     }
 
+    /// The timestamp as written in the manifest.
     pub fn as_str(&self) -> &str {
         &self.text
     }

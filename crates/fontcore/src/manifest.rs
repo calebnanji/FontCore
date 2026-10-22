@@ -58,6 +58,7 @@ pub struct FontEntry {
     pub extra: Map<String, Value>,
 }
 
+/// Serde default for the `enabled` flags, which are on unless the manifest says otherwise.
 pub(crate) fn default_true() -> bool {
     true
 }
@@ -110,6 +111,7 @@ impl Default for Manifest {
 }
 
 impl Manifest {
+    /// Reads and parses the manifest at `path`; see [`Manifest::from_json`].
     pub fn load(path: &Path) -> Result<Self> {
         let text = fs::read_to_string(path).at(path)?;
         Self::parse(&text, path)
