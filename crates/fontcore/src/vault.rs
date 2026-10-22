@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, OpenOptions, TryLockError};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -22,7 +22,6 @@ pub const FONTS_DIR: &str = "fonts";
 
 const LOCK_FILE: &str = ".fontcore.lock";
 const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
-const LOCK_STALE_AFTER: Duration = Duration::from_secs(30);
 
 /// A font vault on disk: a `fonts.json` manifest plus a `fonts/` directory.
 #[derive(Debug, Clone)]
@@ -178,18 +177,23 @@ impl Vault {
     }
 
     /// Removes a font from the manifest and deletes its file.
+    ///
+    /// The file is deleted while the vault lock is held: once the lock is released, an add of the
+    /// same bytes may recreate this exact path, and deleting after that would lose its file. If
+    /// saving the manifest then fails, the entry is left pointing at a missing file, which the
+    /// loader reports as unavailable and [`Vault::verify`] reports as missing.
     pub fn remove(&self, query: &str) -> Result<FontEntry> {
-        let entry = self.update(|manifest| {
+        self.update(|manifest| {
             let i = manifest.find(query)?;
-            Ok(manifest.fonts.remove(i))
-        })?;
-        if let Some(path) = entry.path_in(&self.root) {
-            match fs::remove_file(&path) {
-                Err(e) if e.kind() != ErrorKind::NotFound => return Err(e).at(path),
-                _ => {}
+            let entry = manifest.fonts.remove(i);
+            if let Some(path) = entry.path_in(&self.root) {
+                match fs::remove_file(&path) {
+                    Err(e) if e.kind() != ErrorKind::NotFound => return Err(e).at(path),
+                    _ => {}
+                }
             }
-        }
-        Ok(entry)
+            Ok(entry)
+        })
     }
 
     pub fn set_enabled(&self, query: &str, enabled: bool) -> Result<FontEntry> {
@@ -281,44 +285,39 @@ impl Vault {
         Ok(out)
     }
 
+    /// Takes the vault's write lock, waiting up to [`LOCK_TIMEOUT`] for another writer.
     fn lock(&self) -> Result<LockGuard> {
         let path = self.root.join(LOCK_FILE);
+        let file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .at(&path)?;
         let deadline = Instant::now() + LOCK_TIMEOUT;
         loop {
-            match OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(_) => return Ok(LockGuard(path)),
-                Err(e) if e.kind() == ErrorKind::AlreadyExists => {
-                    if is_stale(&path) {
-                        let _ = fs::remove_file(&path);
-                        continue;
-                    }
-                    if Instant::now() >= deadline {
-                        return Err(Error::Locked(path));
-                    }
-                    thread::sleep(Duration::from_millis(25));
+            match file.try_lock() {
+                Ok(()) => return Ok(LockGuard(file)),
+                Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(25))
                 }
-                Err(e) => return Err(e).at(path),
+                Err(TryLockError::WouldBlock) => return Err(Error::Locked(path)),
+                Err(TryLockError::Error(e)) => return Err(e).at(path),
             }
         }
     }
 }
 
-/// Removes the lock file when dropped.
-struct LockGuard(PathBuf);
+/// The vault's write lock: an OS file lock (`flock`, `LockFileEx`) on `.fontcore.lock`, released
+/// when dropped. The OS also releases it when its holder exits, crash included, so a lock is never
+/// taken over on a guess while its holder is still working. The file itself stays between writes:
+/// deleting it could let two writers lock two different files under the same name.
+struct LockGuard(fs::File);
 
 impl Drop for LockGuard {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
+        let _ = self.0.unlock();
     }
-}
-
-/// A lock left behind by a crashed process.
-fn is_stale(path: &Path) -> bool {
-    fs::metadata(path)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.elapsed().ok())
-        .is_some_and(|age| age > LOCK_STALE_AFTER)
 }
 
 /// Drops repeated app ids, keeping the first occurrence of each.

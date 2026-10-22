@@ -115,7 +115,7 @@ impl Manifest {
         Self::parse(&text, path)
     }
 
-    /// Parses manifest text, rejecting schema versions newer than this build.
+    /// Parses manifest text, rejecting any schema version other than [`SCHEMA_VERSION`].
     pub fn from_json(text: &str) -> Result<Self> {
         Self::parse(text, Path::new(MANIFEST_FILE))
     }
@@ -125,14 +125,15 @@ impl Manifest {
             path: path.to_owned(),
             source,
         };
-        // Check the version before the full parse so a newer manifest gets a
-        // clear error instead of a field-level one.
+        // Check the version before the full parse so another version gets a
+        // clear error instead of a field-level one. Version 1 is the only one
+        // there has ever been; the schema pins it with `"const": 1`.
         #[derive(Deserialize)]
         struct Version {
             schema_version: u32,
         }
         let Version { schema_version } = serde_json::from_str(text).map_err(manifest_error)?;
-        if schema_version > SCHEMA_VERSION {
+        if schema_version != SCHEMA_VERSION {
             return Err(Error::UnsupportedSchema {
                 found: schema_version,
                 supported: SCHEMA_VERSION,
@@ -143,7 +144,10 @@ impl Manifest {
 
     /// Writes the manifest atomically so readers never see a partial file.
     pub fn save(&self, path: &Path) -> Result<()> {
-        let mut json = serde_json::to_vec_pretty(self).expect("manifest serializes");
+        let mut json = serde_json::to_vec_pretty(self).map_err(|source| Error::Manifest {
+            path: path.to_owned(),
+            source,
+        })?;
         json.push(b'\n');
         write_atomic(path, &json)
     }

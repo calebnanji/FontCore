@@ -141,9 +141,9 @@ The layout is published as a JSON Schema (draft 2020-12) at [`schema/fonts.v1.js
 - **Timestamps** are strict RFC 3339. `T` and `Z` must be uppercase, and a `Z` or `±HH:MM` offset is required. Fractional seconds are allowed. FontCore writes whole seconds in UTC, like `2026-10-22T02:30:00Z`, and keeps timestamps written by other tools exactly as they were.
 - **Licenses** in string form are meant to be SPDX expressions. A manifest still loads if a string isn't one this build recognizes, such as an identifier added to SPDX later. `License::is_recognized` and `License::is_open_source` let tools check.
 - **Unknown fields are preserved.** Every object (the manifest, each font, each face, and a custom license) may carry fields this schema doesn't list. Readers ignore them, and FontCore writes them back unchanged when it rewrites the file. Name your fields after your app id, e.g. `"ai.storytold.photocraft:pinned": true`, so they cannot collide with fields added to v1 later.
-- **Versioning:** adding optional fields keeps `schema_version: 1`. A change that existing readers would misread needs a new version. Readers refuse versions newer than they know rather than guess.
+- **Versioning:** adding optional fields keeps `schema_version: 1`. A change that existing readers would misread needs a new version. Readers refuse any version they don't support (this build reads only 1) rather than guess.
 
-Writes are atomic: FontCore writes a temporary file and renames it into place, so apps never read a half-written manifest. A lock file serializes writers; a lock left behind by a crashed process is treated as stale after 30 seconds.
+Writes are atomic: FontCore writes a temporary file and renames it into place, so apps never read a half-written manifest. Writers take an OS file lock on `.fontcore.lock` (`flock` on Unix, `LockFileEx` on Windows) and wait up to 5 seconds for each other. The OS releases the lock when its holder exits, crash included, so there is no stale-lock timeout and a slow writer is never overtaken. Removing a font deletes its file while the lock is still held. Every FontCore writer must use this lock: builds before this change used an older lock protocol, so don't let them write to the same vault at the same time.
 
 ### v1 design decisions
 
@@ -151,7 +151,7 @@ Schema version 1 is **stable** as of 2026-10-22. From now on it changes only by 
 
 | Topic | Decision |
 | --- | --- |
-| Forward compatibility | Every object keeps fields it doesn't recognize and writes them back unchanged. Additive changes keep version 1. Readers refuse versions newer than they know. |
+| Forward compatibility | Every object keeps fields it doesn't recognize and writes them back unchanged. Additive changes keep version 1. Readers refuse versions they don't support. |
 | App ids | Strict lowercase reverse-DNS, such as `ai.storytold.photocraft`, compared exactly. |
 | Collections | Each face has its own `enabled` flag. The font-level `enabled` switches off the whole file. |
 | Timestamps | `added_at` is a strict RFC 3339 string. |

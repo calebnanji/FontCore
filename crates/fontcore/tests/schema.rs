@@ -175,6 +175,11 @@ fn cases() -> Vec<(&'static str, bool, Edit)> {
             Box::new(|d| d["schema_version"] = json!(2)),
         ),
         (
+            "schema version 0",
+            false,
+            Box::new(|d| d["schema_version"] = json!(0)),
+        ),
+        (
             "plain app name",
             false,
             font(|f| f["apps"] = json!(["photocraft"])),
