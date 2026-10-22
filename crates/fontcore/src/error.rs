@@ -12,7 +12,9 @@ pub enum Error {
         path: PathBuf,
         source: serde_json::Error,
     },
-    #[error("manifest schema version {found} is newer than this build supports ({supported}); upgrade FontCore")]
+    #[error(
+        "manifest schema version {found} is not supported: this build reads version {supported}"
+    )]
     UnsupportedSchema { found: u32, supported: u32 },
     #[error("unsupported font format: {0}")]
     UnsupportedFormat(String),

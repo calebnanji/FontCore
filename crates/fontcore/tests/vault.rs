@@ -116,7 +116,12 @@ fn add_copies_and_dedupes() {
 
     let manifest = vault.manifest().unwrap();
     assert_eq!(manifest.fonts, vec![entry]);
-    assert!(!vault.root().join(".fontcore.lock").exists());
+    // The lock was released: another handle can take it straight away.
+    let lock = fs::OpenOptions::new()
+        .write(true)
+        .open(vault.root().join(".fontcore.lock"))
+        .unwrap();
+    lock.try_lock().unwrap();
 }
 
 #[test]
@@ -140,17 +145,18 @@ fn manifest_round_trips_through_json() {
 }
 
 #[test]
-fn newer_schema_is_rejected() {
+fn other_schema_versions_are_rejected() {
     let (_tmp, vault) = setup();
-    fs::write(
-        vault.manifest_path(),
-        r#"{"schema_version": 99, "fonts": []}"#,
-    )
-    .unwrap();
-    assert!(matches!(
-        vault.manifest(),
-        Err(Error::UnsupportedSchema { found: 99, .. })
-    ));
+    for version in [0, 2, 99] {
+        fs::write(
+            vault.manifest_path(),
+            format!(r#"{{"schema_version": {version}, "fonts": []}}"#),
+        )
+        .unwrap();
+        assert!(
+            matches!(vault.manifest(), Err(Error::UnsupportedSchema { found, .. }) if found == version)
+        );
+    }
 }
 
 #[test]
@@ -398,15 +404,54 @@ fn verify_finds_problems() {
 }
 
 #[test]
-fn stale_lock_is_reclaimed() {
+fn a_lock_file_nobody_holds_does_not_block() {
+    // What a crashed writer leaves behind: the file, but no lock on it.
     let (tmp, vault) = setup();
-    let lock = vault.root().join(".fontcore.lock");
-    let file = fs::File::create(&lock).unwrap();
-    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
-    file.set_modified(old).unwrap();
+    fs::File::create(vault.root().join(".fontcore.lock")).unwrap();
     let src = write(tmp.path(), "a.ttf", &common::ttf("A", "Regular", "a"));
     vault.add(&src, &AddOptions::default()).unwrap();
-    assert!(!lock.exists());
+}
+
+#[test]
+fn a_held_lock_makes_writers_wait_however_old_it_is() {
+    let (tmp, vault) = setup();
+    let lock = vault.root().join(".fontcore.lock");
+    let holder = fs::File::create(&lock).unwrap();
+    holder.lock().unwrap();
+    // Old enough that the previous age-based rule would have taken it over.
+    holder
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(120))
+        .unwrap();
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        drop(holder);
+    });
+    let src = write(tmp.path(), "a.ttf", &common::ttf("A", "Regular", "a"));
+    let started = std::time::Instant::now();
+    vault.add(&src, &AddOptions::default()).unwrap();
+    assert!(
+        started.elapsed() >= std::time::Duration::from_millis(250),
+        "the add went ahead while the lock was held"
+    );
+    release.join().unwrap();
+    assert_eq!(vault.manifest().unwrap().fonts.len(), 1);
+}
+
+#[test]
+fn removing_then_adding_the_same_font_keeps_its_file() {
+    // The path is content-addressed, so the re-add recreates the very file remove deleted.
+    let (tmp, vault) = setup();
+    let src = write(tmp.path(), "a.ttf", &common::ttf("A", "Regular", "a"));
+    let entry = vault
+        .add(&src, &AddOptions::default())
+        .unwrap()
+        .entry()
+        .clone();
+    vault.remove(&entry.id).unwrap();
+    let again = vault.add(&src, &AddOptions::default()).unwrap();
+    assert!(matches!(again, AddOutcome::Added(_)));
+    assert!(vault.root().join(&entry.file).is_file());
+    assert!(vault.verify().unwrap().is_empty());
 }
 
 #[test]
