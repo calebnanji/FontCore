@@ -22,6 +22,14 @@ pub enum Error {
     NotFound(String),
     #[error("id '{0}' is ambiguous: it matches {1} fonts")]
     Ambiguous(String, usize),
+    #[error(
+        "invalid app id '{0}': expected lowercase reverse-DNS such as ai.storytold.photocraft"
+    )]
+    InvalidAppId(String),
+    #[error("invalid timestamp '{0}': expected RFC 3339 such as 2026-10-22T02:30:00Z")]
+    InvalidTimestamp(String),
+    #[error("font {id} has no face with index {index}")]
+    NoSuchFace { id: String, index: u32 },
     #[error("no vault at {} (run `fontcore init`)", .0.display())]
     NotInitialized(PathBuf),
     #[error("timed out waiting for vault lock {}", .0.display())]

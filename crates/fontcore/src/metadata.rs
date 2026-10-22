@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 use ttf_parser::{name_id, Face, Language};
 
+use crate::manifest::default_true;
 use crate::{Error, Result};
 
 /// On-disk container format of a vault font.
@@ -40,7 +42,8 @@ impl FontFormat {
     }
 }
 
-/// Naming and style information for one face inside a font file.
+/// Naming and style information for one face inside a font file, plus
+/// whether apps may load it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FaceInfo {
     /// Index of the face inside a collection; 0 for single-face files.
@@ -53,9 +56,17 @@ pub struct FaceInfo {
     pub postscript_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    /// OS/2 weight class, 1–1000.
     pub weight: u16,
     pub italic: bool,
     pub monospaced: bool,
+    /// `false` hides this face from apps. Mainly useful for collections,
+    /// where the other faces stay available.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Fields this build does not know about, preserved on rewrite.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 /// Parses a font file and returns its format and every face it contains.
@@ -93,9 +104,11 @@ fn face_info(face: &Face, index: u32) -> FaceInfo {
         full_name: name(face, name_id::FULL_NAME),
         postscript_name,
         version: name(face, name_id::VERSION),
-        weight: face.weight().to_number(),
+        weight: face.weight().to_number().clamp(1, 1000),
         italic: face.is_italic(),
         monospaced: face.is_monospaced(),
+        enabled: true,
+        extra: Map::new(),
     }
 }
 

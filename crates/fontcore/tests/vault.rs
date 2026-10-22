@@ -3,13 +3,19 @@ mod common;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use fontcore::{inspect, AddOptions, AddOutcome, Error, FontFormat, Issue, Manifest, Vault};
+use fontcore::{
+    inspect, AddOptions, AddOutcome, AppId, Error, FontFormat, Issue, License, Manifest, Vault,
+};
 use tempfile::TempDir;
 
 fn write(dir: &Path, name: &str, data: &[u8]) -> PathBuf {
     let path = dir.join(name);
     fs::write(&path, data).unwrap();
     path
+}
+
+fn app(id: &str) -> AppId {
+    AppId::new(id).unwrap()
 }
 
 fn setup() -> (TempDir, Vault) {
@@ -39,9 +45,9 @@ fn inspect_reads_collections() {
     assert_eq!(format, FontFormat::Ttc);
     let styles: Vec<_> = faces
         .iter()
-        .map(|f| (f.index, f.subfamily.as_str()))
+        .map(|f| (f.index, f.subfamily.as_str(), f.enabled))
         .collect();
-    assert_eq!(styles, [(0, "Regular"), (1, "Italic")]);
+    assert_eq!(styles, [(0, "Regular", true), (1, "Italic", true)]);
 }
 
 #[test]
@@ -87,7 +93,7 @@ fn add_copies_and_dedupes() {
     );
     let options = AddOptions {
         tags: vec!["display".into()],
-        license: Some("OFL-1.1".into()),
+        license: License::parse("OFL-1.1"),
         ..Default::default()
     };
 
@@ -123,6 +129,12 @@ fn manifest_round_trips_through_json() {
     let json: serde_json::Value = serde_json::from_str(&text).unwrap();
     assert_eq!(json["schema_version"], 1);
     assert_eq!(json["fonts"][0]["faces"][0]["family"], "A");
+    assert_eq!(json["fonts"][0]["faces"][0]["enabled"], true);
+    let added_at = json["fonts"][0]["added_at"].as_str().unwrap();
+    assert!(
+        added_at.ends_with('Z') && added_at.len() == 20,
+        "{added_at}"
+    );
     // Empty optional fields are omitted to keep the file readable.
     assert!(json["fonts"][0].get("apps").is_none());
 }
@@ -181,6 +193,7 @@ fn remove_deletes_file() {
 #[test]
 fn fonts_for_app_respects_scope_and_state() {
     let (tmp, vault) = setup();
+    let photo = "ai.storytold.photocraft";
     let add = |name: &str, apps: &[&str]| {
         let src = write(
             tmp.path(),
@@ -188,35 +201,106 @@ fn fonts_for_app_respects_scope_and_state() {
             &common::ttf(name, "Regular", name),
         );
         let options = AddOptions {
-            apps: apps.iter().map(|s| s.to_string()).collect(),
+            // Duplicates are dropped on import.
+            apps: apps.iter().chain(apps).map(|s| app(s)).collect(),
             ..Default::default()
         };
-        vault.add(&src, &options).unwrap().entry().id.clone()
+        vault.add(&src, &options).unwrap().entry().clone()
     };
     add("Global", &[]);
-    add("PhotoOnly", &["photocraft"]);
-    let hidden = add("Hidden", &[]);
+    assert_eq!(add("PhotoOnly", &[photo]).apps, [app(photo)]);
+    let hidden = add("Hidden", &[]).id;
     vault.set_enabled(&hidden, false).unwrap();
 
-    let families = |app: &str| -> Vec<String> {
-        let set = vault.fonts_for_app(app).unwrap();
+    let families = |id: &str| -> Vec<String> {
+        let set = vault.fonts_for_app(&app(id)).unwrap();
         assert!(set.unavailable.is_empty());
         set.fonts
             .iter()
             .map(|f| f.entry.family().to_owned())
             .collect()
     };
-    assert_eq!(families("photocraft"), ["Global", "PhotoOnly"]);
-    assert_eq!(families("PhotoCraft"), ["Global", "PhotoOnly"]);
-    assert_eq!(families("wordcraft"), ["Global"]);
+    assert_eq!(families(photo), ["Global", "PhotoOnly"]);
+    assert_eq!(families("ai.storytold.wordcraft"), ["Global"]);
 
     vault.set_enabled(&hidden, true).unwrap();
-    assert_eq!(families("wordcraft"), ["Global", "Hidden"]);
+    assert_eq!(families("ai.storytold.wordcraft"), ["Global", "Hidden"]);
 
-    let set = vault.fonts_for_app("pdfcraft").unwrap();
+    let set = vault.fonts_for_app(&app("ai.storytold.pdfcraft")).unwrap();
     assert_eq!(
         set.fonts[0].read().unwrap(),
         fs::read(&set.fonts[0].path).unwrap()
+    );
+}
+
+#[test]
+fn faces_toggle_individually() {
+    let (tmp, vault) = setup();
+    let data = common::ttc(&[
+        common::ttf("Craft", "Regular", "a"),
+        common::ttf("Craft", "Italic", "b"),
+    ]);
+    let src = write(tmp.path(), "craft.ttc", &data);
+    let id = vault
+        .add(&src, &AddOptions::default())
+        .unwrap()
+        .entry()
+        .id
+        .clone();
+    let wordcraft = app("ai.storytold.wordcraft");
+    let active = || -> Vec<u32> {
+        let set = vault.fonts_for_app(&wordcraft).unwrap();
+        set.fonts
+            .iter()
+            .flat_map(|f| f.faces().map(|face| face.index))
+            .collect()
+    };
+    assert_eq!(active(), [0, 1]);
+
+    let entry = vault.set_face_enabled(&id, 1, false).unwrap();
+    assert!(entry.enabled && !entry.faces[1].enabled);
+    assert_eq!(active(), [0]);
+
+    // Disabling every face hides the file, as does disabling the entry.
+    vault.set_face_enabled(&id, 0, false).unwrap();
+    assert!(active().is_empty());
+    vault.set_face_enabled(&id, 0, true).unwrap();
+    vault.set_enabled(&id, false).unwrap();
+    assert!(active().is_empty());
+    vault.set_enabled(&id, true).unwrap();
+    assert_eq!(active(), [0]);
+
+    assert!(matches!(
+        vault.set_face_enabled(&id, 2, true),
+        Err(Error::NoSuchFace { index: 2, .. })
+    ));
+}
+
+#[test]
+fn unsafe_paths_are_rejected() {
+    let (tmp, vault) = setup();
+    let src = write(tmp.path(), "a.ttf", &common::ttf("A", "Regular", "a"));
+    let mut entry = vault
+        .add(&src, &AddOptions::default())
+        .unwrap()
+        .entry()
+        .clone();
+    for bad in [
+        "",
+        "/etc/x.ttf",
+        "fonts//x.ttf",
+        "./x.ttf",
+        "fonts/../x.ttf",
+        "fonts\\x.ttf",
+        "C:/x.ttf",
+    ] {
+        entry.file = bad.into();
+        assert_eq!(entry.path_in(vault.root()), None, "{bad:?}");
+    }
+    entry.file = "fonts/x.ttf".into();
+    assert_eq!(
+        entry.path_in(vault.root()),
+        Some(vault.root().join("fonts").join("x.ttf"))
     );
 }
 
@@ -238,7 +322,7 @@ fn loader_reports_missing_and_unsafe_entries() {
     manifest.save(&vault.manifest_path()).unwrap();
     fs::write(vault.root().join("../outside.ttf"), b"x").unwrap();
 
-    let set = vault.fonts_for_app("wordcraft").unwrap();
+    let set = vault.fonts_for_app(&app("ai.storytold.wordcraft")).unwrap();
     assert!(set.fonts.is_empty());
     assert_eq!(set.unavailable.len(), 2);
 }
