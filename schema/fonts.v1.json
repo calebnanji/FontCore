@@ -34,7 +34,7 @@
           "not": { "pattern": "(^|/)\\.{1,2}(/|$)" }
         },
         "format": {
-          "description": "Container format. 'ttc' covers both .ttc and .otc collections.",
+          "description": "Container format. 'ttc' covers both .ttc and .otc collections. Variable fonts use these same values; WOFF/WOFF2 are never stored.",
           "enum": ["ttf", "otf", "ttc"]
         },
         "sha256": {

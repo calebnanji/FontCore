@@ -1,5 +1,8 @@
 //! Builds minimal valid sfnt fonts so tests need no binary fixtures.
 
+// Each test crate uses a different subset of these helpers.
+#![allow(dead_code)]
+
 /// A single-face TrueType font with the given family/subfamily names.
 /// `salt` lands in the version string so otherwise-equal fonts hash apart.
 pub fn ttf(family: &str, subfamily: &str, salt: &str) -> Vec<u8> {
@@ -10,12 +13,25 @@ pub fn ttf(family: &str, subfamily: &str, salt: &str) -> Vec<u8> {
         (5, format!("Version 1.0 {salt}")),
         (6, format!("{family}-{subfamily}").replace(' ', "")),
     ];
-    sfnt(&[
+    sfnt(&base_tables(&names))
+}
+
+/// A single-face variable font: `ttf` plus an `fvar` table with a `wght`
+/// axis (100–900) and one named instance.
+pub fn variable_ttf(family: &str) -> Vec<u8> {
+    let names = [(1, family.to_owned()), (2, "Regular".to_owned())];
+    let mut tables = base_tables(&names);
+    tables.push((*b"fvar", fvar()));
+    sfnt(&tables)
+}
+
+fn base_tables(names: &[(u16, String)]) -> Vec<([u8; 4], Vec<u8>)> {
+    vec![
         (*b"head", head()),
         (*b"hhea", hhea()),
         (*b"maxp", maxp()),
-        (*b"name", name(&names)),
-    ])
+        (*b"name", name(names)),
+    ]
 }
 
 /// A TrueType collection wrapping the given single-face fonts.
@@ -85,6 +101,27 @@ fn hhea() -> Vec<u8> {
 fn maxp() -> Vec<u8> {
     let mut t = 0x0000_5000u32.to_be_bytes().to_vec();
     t.extend_from_slice(&1u16.to_be_bytes());
+    t
+}
+
+fn fvar() -> Vec<u8> {
+    let fixed = |v: i32| (v << 16).to_be_bytes();
+    let mut t = Vec::new();
+    // version 1.0, axesArrayOffset, reserved, axisCount, axisSize,
+    // instanceCount, instanceSize
+    for v in [1u16, 0, 16, 2, 1, 20, 1, 8] {
+        t.extend_from_slice(&v.to_be_bytes());
+    }
+    t.extend_from_slice(b"wght");
+    for v in [100, 400, 900] {
+        t.extend_from_slice(&fixed(v));
+    }
+    t.extend_from_slice(&0u16.to_be_bytes()); // flags
+    t.extend_from_slice(&256u16.to_be_bytes()); // axisNameID
+                                                // Instance: subfamilyNameID, flags, then one coordinate (wght 700).
+    t.extend_from_slice(&2u16.to_be_bytes());
+    t.extend_from_slice(&0u16.to_be_bytes());
+    t.extend_from_slice(&fixed(700));
     t
 }
 

@@ -233,6 +233,42 @@ fn fonts_for_app_respects_scope_and_state() {
     );
 }
 
+/// Variable fonts are stored like any other TTF/OTF: the file is copied
+/// byte for byte, so its axes and named instances reach apps intact, but the
+/// manifest records only the default face.
+#[test]
+fn variable_fonts_import_as_ordinary_files() {
+    let (tmp, vault) = setup();
+    let data = common::variable_ttf("Story Flex");
+    let parsed = ttf_parser::Face::parse(&data, 0).unwrap();
+    assert!(parsed.is_variable());
+    assert_eq!(parsed.variation_axes().len(), 1);
+
+    let src = write(tmp.path(), "StoryFlex[wght].ttf", &data);
+    let entry = vault
+        .add(&src, &AddOptions::default())
+        .unwrap()
+        .entry()
+        .clone();
+    assert_eq!(entry.format, FontFormat::Ttf);
+    assert_eq!(entry.faces.len(), 1);
+    assert_eq!(entry.faces[0].family, "Story Flex");
+
+    let set = vault
+        .fonts_for_app(&app("ai.storytold.photocraft"))
+        .unwrap();
+    let stored = set.fonts[0].read().unwrap();
+    assert_eq!(stored, data);
+    let axes = ttf_parser::Face::parse(&stored, 0)
+        .unwrap()
+        .variation_axes();
+    let axis = axes.get(0).unwrap();
+    assert_eq!(
+        (axis.tag, axis.min_value, axis.max_value),
+        (ttf_parser::Tag::from_bytes(b"wght"), 100.0, 900.0)
+    );
+}
+
 #[test]
 fn faces_toggle_individually() {
     let (tmp, vault) = setup();

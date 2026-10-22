@@ -49,7 +49,7 @@ fontcore remove 1f3a
 fontcore verify                                # missing files, hash mismatches, orphans
 ```
 
-Supported formats are TrueType (`.ttf`), OpenType/CFF (`.otf`), and collections (`.ttc`, `.otc`). FontCore checks a file's signature, not its extension. WOFF and WOFF2 files are rejected; convert them to TTF or OTF first.
+Supported formats are TrueType (`.ttf`), OpenType/CFF (`.otf`), and collections (`.ttc`, `.otc`). Variable fonts in any of these formats are supported. FontCore checks a file's signature, not its extension. WOFF and WOFF2 files are rejected; convert them to TTF or OTF first (see [v1 design decisions](#v1-design-decisions)).
 
 `--license` takes an SPDX license expression such as `OFL-1.1` or `MIT OR Apache-2.0`. A single id in the wrong case (`ofl-1.1`) is corrected. Any other text is stored as a custom license, with a warning. FontCore also warns when an SPDX license is neither OSI-approved nor FSF free/libre (for example `CC-BY-NC-4.0`). Warnings never block the import.
 
@@ -84,7 +84,7 @@ fn register_fonts() -> fontcore::Result<()> {
 
 Management tools can use `fontcore::Vault` directly (`init`, `add`, `remove`, `set_enabled`, `set_face_enabled`, `set_apps`, `verify`).
 
-## `fonts.json` schema (version 1)
+## `fonts.json` schema (version 1, stable)
 
 The layout is published as a JSON Schema (draft 2020-12) at [`schema/fonts.v1.json`](schema/fonts.v1.json). Tools in any language can validate a manifest against it. A test in `crates/fontcore/tests/schema.rs` checks the schema against the Rust types, so the two cannot drift apart.
 
@@ -144,6 +144,30 @@ The layout is published as a JSON Schema (draft 2020-12) at [`schema/fonts.v1.js
 - **Versioning:** adding optional fields keeps `schema_version: 1`. A change that existing readers would misread needs a new version. Readers refuse versions newer than they know rather than guess.
 
 Writes are atomic: FontCore writes a temporary file and renames it into place, so apps never read a half-written manifest. A lock file serializes writers; a lock left behind by a crashed process is treated as stale after 30 seconds.
+
+### v1 design decisions
+
+Schema version 1 is **stable** as of 2026-10-22. From now on it changes only by adding optional fields, and anything else needs `schema_version: 2`. These are the decisions behind it, settled in [issue #2](https://github.com/calebnanji/FontCore/issues/2).
+
+| Topic | Decision |
+| --- | --- |
+| Forward compatibility | Every object keeps fields it doesn't recognize and writes them back unchanged. Additive changes keep version 1. Readers refuse versions newer than they know. |
+| App ids | Strict lowercase reverse-DNS, such as `ai.storytold.photocraft`, compared exactly. |
+| Collections | Each face has its own `enabled` flag. The font-level `enabled` switches off the whole file. |
+| Timestamps | `added_at` is a strict RFC 3339 string. |
+| Licenses | An SPDX expression string, or `{"custom": "..."}` for licenses without an SPDX id. The CLI warns at import when a license isn't recognized or isn't open source. |
+| Variable fonts | Supported; see below. |
+| Web fonts | WOFF/WOFF2 are rejected at import; see below. |
+| Grouping | `tags` only; see below. |
+| Migration | A dedicated migration tool, if v2 is ever needed; see below. |
+
+**Variable fonts.** OpenType variable fonts (`.ttf`, `.otf`, and collections containing them) are stored like any other font. The file is copied byte for byte, so its axes and named instances reach apps intact. `fonts.json` deliberately doesn't record axes or named instances: each file gets one face entry describing its default instance, which keeps the manifest small. Apps that need axes or instances read them at runtime from the font data the loader returns (`ResolvedFont::read` or `ResolvedFont::path`), for example from the `fvar` table with their text engine or `ttf-parser`. If listing axes without parsing ever becomes necessary, an optional field can add it within v1.
+
+**Web fonts.** WOFF and WOFF2 are rejected when you try to add them to the vault. `fonts.json` never contains them, and `format` stays `ttf`, `otf` or `ttc`. Tools that start from web fonts must convert them to TTF or OTF before importing.
+
+**Grouping.** v1 organizes fonts only with the free-form `tags` array. Named sets such as "Brand Kit" or "Display" are left to each app. An app that wants them stores them in its own extension fields, named after its app id, which FontCore preserves. For example, a top-level `"ai.storytold.photocraft:sets": {"Brand Kit": ["1f3a9c0d2b7e4a51"]}`. FontCore itself gives these fields no meaning.
+
+**Migration to a future version 2.** If `schema_version: 2` is ever needed, the `fontcore` crate will ship a dedicated migration tool. It will rewrite `fonts.json` from v1 to v2 separately from the apps (taking the vault lock and writing atomically, like every other write) before any suite app built for v2 reads the vault. Apps never migrate the manifest themselves. Because readers already refuse versions newer than they know, an app built for v1 stops with a clear error on a migrated vault instead of misreading it.
 
 ## Development
 
