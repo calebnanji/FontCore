@@ -1,0 +1,310 @@
+use std::collections::HashSet;
+use std::fs::{self, OpenOptions};
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use sha2::{Digest, Sha256};
+
+use crate::error::IoContext;
+use crate::manifest::write_atomic;
+use crate::{inspect, Error, FontEntry, Manifest, Result, MANIFEST_FILE};
+
+/// Environment variable that overrides the default vault location.
+pub const HOME_ENV: &str = "FONTCORE_HOME";
+
+/// Directory inside the vault that holds the font files.
+pub const FONTS_DIR: &str = "fonts";
+
+const LOCK_FILE: &str = ".fontcore.lock";
+const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+const LOCK_STALE_AFTER: Duration = Duration::from_secs(30);
+
+/// A font vault on disk: a `fonts.json` manifest plus a `fonts/` directory.
+#[derive(Debug, Clone)]
+pub struct Vault {
+    root: PathBuf,
+}
+
+/// Metadata attached to fonts on import.
+#[derive(Debug, Clone, Default)]
+pub struct AddOptions {
+    pub apps: Vec<String>,
+    pub tags: Vec<String>,
+    pub license: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub enum AddOutcome {
+    Added(FontEntry),
+    /// A byte-identical file is already in the vault; nothing was changed.
+    AlreadyPresent(FontEntry),
+}
+
+impl AddOutcome {
+    pub fn entry(&self) -> &FontEntry {
+        match self {
+            Self::Added(e) | Self::AlreadyPresent(e) => e,
+        }
+    }
+}
+
+/// A problem found by [`Vault::verify`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Issue {
+    UnsafePath {
+        id: String,
+        file: String,
+    },
+    MissingFile {
+        id: String,
+        path: PathBuf,
+    },
+    HashMismatch {
+        id: String,
+        path: PathBuf,
+    },
+    /// A file in `fonts/` that no manifest entry references.
+    Orphan {
+        path: PathBuf,
+    },
+}
+
+impl std::fmt::Display for Issue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsafePath { id, file } => write!(f, "{id}: unsafe path '{file}'"),
+            Self::MissingFile { id, path } => write!(f, "{id}: missing file {}", path.display()),
+            Self::HashMismatch { id, path } => {
+                write!(
+                    f,
+                    "{id}: contents of {} do not match recorded hash",
+                    path.display()
+                )
+            }
+            Self::Orphan { path } => write!(f, "orphaned file {}", path.display()),
+        }
+    }
+}
+
+impl Vault {
+    /// `$FONTCORE_HOME`, or the platform data directory
+    /// (e.g. `~/.local/share/fontcore`, `%APPDATA%\storytold\fontcore\data`).
+    pub fn default_root() -> Result<PathBuf> {
+        if let Some(home) = std::env::var_os(HOME_ENV).filter(|v| !v.is_empty()) {
+            return Ok(PathBuf::from(home));
+        }
+        directories::ProjectDirs::from("", "storytold", "fontcore")
+            .map(|dirs| dirs.data_dir().to_owned())
+            .ok_or(Error::NoHome)
+    }
+
+    /// Opens an existing vault.
+    pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
+        let vault = Self { root: root.into() };
+        if !vault.manifest_path().is_file() {
+            return Err(Error::NotInitialized(vault.root));
+        }
+        Ok(vault)
+    }
+
+    /// Opens the vault at `root`, creating it if needed.
+    pub fn init(root: impl Into<PathBuf>) -> Result<Self> {
+        let vault = Self { root: root.into() };
+        let fonts = vault.root.join(FONTS_DIR);
+        fs::create_dir_all(&fonts).at(&fonts)?;
+        let manifest = vault.manifest_path();
+        if !manifest.exists() {
+            Manifest::default().save(&manifest)?;
+        }
+        Ok(vault)
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn manifest_path(&self) -> PathBuf {
+        self.root.join(MANIFEST_FILE)
+    }
+
+    pub fn manifest(&self) -> Result<Manifest> {
+        Manifest::load(&self.manifest_path())
+    }
+
+    /// Looks up one entry by id or unique id prefix.
+    pub fn get(&self, query: &str) -> Result<FontEntry> {
+        let mut manifest = self.manifest()?;
+        let i = manifest.find(query)?;
+        Ok(manifest.fonts.swap_remove(i))
+    }
+
+    /// Copies a font file into the vault and records it in the manifest.
+    pub fn add(&self, path: &Path, options: &AddOptions) -> Result<AddOutcome> {
+        let data = fs::read(path).at(path)?;
+        let (format, faces) = inspect(&data)?;
+        let sha256 = hex(&Sha256::digest(&data));
+        let id = sha256[..16].to_owned();
+        let file = format!("{FONTS_DIR}/{id}.{}", format.extension());
+
+        self.update(|manifest| {
+            if let Some(existing) = manifest.fonts.iter().find(|f| f.sha256 == sha256) {
+                return Ok(AddOutcome::AlreadyPresent(existing.clone()));
+            }
+            let dest = self.root.join(&file);
+            write_atomic(&dest, &data)?;
+            let entry = FontEntry {
+                id,
+                file,
+                format,
+                sha256,
+                size: data.len() as u64,
+                faces,
+                enabled: true,
+                apps: options.apps.clone(),
+                tags: options.tags.clone(),
+                license: options.license.clone(),
+                source: path.file_name().map(|n| n.to_string_lossy().into_owned()),
+                added_at: now(),
+            };
+            manifest.fonts.push(entry.clone());
+            Ok(AddOutcome::Added(entry))
+        })
+    }
+
+    /// Removes a font from the manifest and deletes its file.
+    pub fn remove(&self, query: &str) -> Result<FontEntry> {
+        let entry = self.update(|manifest| {
+            let i = manifest.find(query)?;
+            Ok(manifest.fonts.remove(i))
+        })?;
+        if let Some(path) = entry.path_in(&self.root) {
+            match fs::remove_file(&path) {
+                Err(e) if e.kind() != ErrorKind::NotFound => return Err(e).at(path),
+                _ => {}
+            }
+        }
+        Ok(entry)
+    }
+
+    pub fn set_enabled(&self, query: &str, enabled: bool) -> Result<FontEntry> {
+        self.modify(query, |entry| entry.enabled = enabled)
+    }
+
+    /// Restricts a font to the given apps; an empty list makes it global.
+    pub fn set_apps(&self, query: &str, apps: Vec<String>) -> Result<FontEntry> {
+        self.modify(query, |entry| entry.apps = apps)
+    }
+
+    /// Checks that every entry's file exists and matches its hash, and that
+    /// `fonts/` holds no unreferenced files.
+    pub fn verify(&self) -> Result<Vec<Issue>> {
+        let manifest = self.manifest()?;
+        let mut issues = Vec::new();
+        let mut referenced = HashSet::new();
+        for entry in &manifest.fonts {
+            let Some(path) = entry.path_in(&self.root) else {
+                issues.push(Issue::UnsafePath {
+                    id: entry.id.clone(),
+                    file: entry.file.clone(),
+                });
+                continue;
+            };
+            referenced.insert(path.clone());
+            match fs::read(&path) {
+                Ok(data) if hex(&Sha256::digest(&data)) == entry.sha256 => {}
+                Ok(_) => issues.push(Issue::HashMismatch {
+                    id: entry.id.clone(),
+                    path,
+                }),
+                Err(e) if e.kind() == ErrorKind::NotFound => issues.push(Issue::MissingFile {
+                    id: entry.id.clone(),
+                    path,
+                }),
+                Err(e) => return Err(e).at(path),
+            }
+        }
+        let fonts_dir = self.root.join(FONTS_DIR);
+        if fonts_dir.is_dir() {
+            for dirent in fs::read_dir(&fonts_dir).at(&fonts_dir)? {
+                let path = dirent.at(&fonts_dir)?.path();
+                if path.is_file() && !referenced.contains(&path) {
+                    issues.push(Issue::Orphan { path });
+                }
+            }
+        }
+        Ok(issues)
+    }
+
+    fn modify(&self, query: &str, f: impl FnOnce(&mut FontEntry)) -> Result<FontEntry> {
+        self.update(|manifest| {
+            let i = manifest.find(query)?;
+            f(&mut manifest.fonts[i]);
+            Ok(manifest.fonts[i].clone())
+        })
+    }
+
+    /// Runs a read-modify-write of the manifest under the vault lock. The
+    /// manifest is saved only if `f` succeeds.
+    fn update<T>(&self, f: impl FnOnce(&mut Manifest) -> Result<T>) -> Result<T> {
+        let _lock = self.lock()?;
+        let path = self.manifest_path();
+        let mut manifest = Manifest::load(&path)?;
+        let before = manifest.clone();
+        let out = f(&mut manifest)?;
+        if manifest != before {
+            manifest.save(&path)?;
+        }
+        Ok(out)
+    }
+
+    fn lock(&self) -> Result<LockGuard> {
+        let path = self.root.join(LOCK_FILE);
+        let deadline = Instant::now() + LOCK_TIMEOUT;
+        loop {
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(_) => return Ok(LockGuard(path)),
+                Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                    if is_stale(&path) {
+                        let _ = fs::remove_file(&path);
+                        continue;
+                    }
+                    if Instant::now() >= deadline {
+                        return Err(Error::Locked(path));
+                    }
+                    thread::sleep(Duration::from_millis(25));
+                }
+                Err(e) => return Err(e).at(path),
+            }
+        }
+    }
+}
+
+/// Removes the lock file when dropped.
+struct LockGuard(PathBuf);
+
+impl Drop for LockGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+/// A lock left behind by a crashed process.
+fn is_stale(path: &Path) -> bool {
+    fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age > LOCK_STALE_AFTER)
+}
+
+fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}

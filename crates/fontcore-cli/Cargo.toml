@@ -1,0 +1,17 @@
+[package]
+name = "fontcore-cli"
+description = "Command-line manager for the FontCore font vault"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "fontcore"
+path = "src/main.rs"
+
+[dependencies]
+fontcore.workspace = true
+clap.workspace = true
+serde_json.workspace = true
