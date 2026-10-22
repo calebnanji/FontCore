@@ -136,3 +136,18 @@ cargo fmt --all
 ```
 
 Tests generate minimal TrueType files in code (`crates/fontcore/tests/common`), so the repository contains no binary font fixtures.
+
+## License
+
+FontCore is dual-licensed under either of:
+
+- the Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or <https://www.apache.org/licenses/LICENSE-2.0>)
+- the MIT License ([LICENSE-MIT](LICENSE-MIT) or <https://opensource.org/licenses/MIT>)
+
+You may use it under whichever license you prefer. This is the usual arrangement in the Rust ecosystem. MIT is short and permissive. Apache-2.0 adds an explicit patent grant and patent-retaliation terms. Offering both lets downstream projects choose the one that fits their own licensing. Both crates in this workspace declare `license = "MIT OR Apache-2.0"`.
+
+This license covers FontCore's own code. Fonts you import into a vault keep their own licenses (for example `OFL-1.1`), which you can record in each entry's `license` field.
+
+### Contribution
+
+Unless you explicitly state otherwise, any contribution you intentionally submit for inclusion in this work, as defined in the Apache-2.0 license, is dual-licensed as above, without any additional terms or conditions.
