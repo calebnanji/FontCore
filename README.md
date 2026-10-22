@@ -37,18 +37,21 @@ cargo install --path crates/fontcore-cli
 
 fontcore init                                  # create the vault
 fontcore add ~/Downloads/Inter --license OFL-1.1
-fontcore add Brand.otf --app photocraft --tag brand
+fontcore add Brand.otf --app ai.storytold.photocraft --tag brand
 fontcore list                                  # table; add --json for machine output
-fontcore list --app wordcraft                  # what wordcraft will load
+fontcore list --app ai.storytold.wordcraft     # what wordcraft will load
 fontcore info 1f3a                             # any unique id prefix works
-fontcore scope 1f3a photocraft pdfcraft        # restrict to apps (no apps = all)
+fontcore scope 1f3a ai.storytold.photocraft ai.storytold.pdfcraft   # no apps = all
 fontcore disable 1f3a                          # hide from apps, keep in vault
-fontcore enable 1f3a
+fontcore disable 8be0 --face 2                 # hide one face of a collection
+fontcore enable 8be0 --face 2
 fontcore remove 1f3a
 fontcore verify                                # missing files, hash mismatches, orphans
 ```
 
 Supported formats are TrueType (`.ttf`), OpenType/CFF (`.otf`), and collections (`.ttc`, `.otc`). FontCore checks a file's signature, not its extension. WOFF and WOFF2 files are rejected; convert them to TTF or OTF first.
+
+`--license` takes an SPDX license expression such as `OFL-1.1` or `MIT OR Apache-2.0`. A single id in the wrong case (`ofl-1.1`) is corrected. Any other text is stored as a custom license, with a warning. FontCore also warns when an SPDX license is neither OSI-approved nor FSF free/libre (for example `CC-BY-NC-4.0`). Warnings never block the import.
 
 ## Using FontCore from a suite app
 
@@ -63,10 +66,12 @@ Then load the fonts at startup:
 
 ```rust
 fn register_fonts() -> fontcore::Result<()> {
-    let set = fontcore::load_for_app("photocraft")?;
+    let set = fontcore::load_for_app("ai.storytold.photocraft")?;
     for font in &set.fonts {
         let bytes = font.read()?;          // or pass font.path to the text engine
-        my_text_engine::register(&bytes, &font.entry.faces);
+        for face in font.faces() {         // enabled faces only
+            my_text_engine::register(&bytes, face.index);
+        }
     }
     for missing in &set.unavailable {
         log::warn!("font {} listed in fonts.json but unavailable", missing.id);
@@ -75,11 +80,13 @@ fn register_fonts() -> fontcore::Result<()> {
 }
 ```
 
-`load_for_app` only reads; it never writes to the vault. If no vault exists yet, it returns an empty set, so an app can call it on every launch without checking first. App names are compared case-insensitively.
+`load_for_app` only reads; it never writes to the vault. If no vault exists yet, it returns an empty set, so an app can call it on every launch without checking first. The app id must be a lowercase reverse-DNS id (see below); anything else returns `Error::InvalidAppId`. For collections, register only the faces `font.faces()` returns: the user may have disabled some.
 
-Management tools can use `fontcore::Vault` directly (`init`, `add`, `remove`, `set_enabled`, `set_apps`, `verify`).
+Management tools can use `fontcore::Vault` directly (`init`, `add`, `remove`, `set_enabled`, `set_face_enabled`, `set_apps`, `verify`).
 
 ## `fonts.json` schema (version 1)
+
+The layout is published as a JSON Schema (draft 2020-12) at [`schema/fonts.v1.json`](schema/fonts.v1.json). Tools in any language can validate a manifest against it. A test in `crates/fontcore/tests/schema.rs` checks the schema against the Rust types, so the two cannot drift apart.
 
 ```json
 {
@@ -101,15 +108,16 @@ Management tools can use `fontcore::Vault` directly (`init`, `add`, `remove`, `s
           "version": "Version 4.000",
           "weight": 700,
           "italic": false,
-          "monospaced": false
+          "monospaced": false,
+          "enabled": true
         }
       ],
       "enabled": true,
-      "apps": ["photocraft"],
+      "apps": ["ai.storytold.photocraft"],
       "tags": ["brand"],
       "license": "OFL-1.1",
       "source": "Inter-Bold.ttf",
-      "added_at": 1792646718
+      "added_at": "2026-10-22T02:30:00Z"
     }
   ]
 }
@@ -117,15 +125,25 @@ Management tools can use `fontcore::Vault` directly (`init`, `add`, `remove`, `s
 
 | Field | Meaning |
 | --- | --- |
-| `file` | Path relative to the vault root, using `/`. Readers reject absolute paths and `..`. |
+| `file` | Path relative to the vault root: `/`-separated, non-empty segments, with no `.`, `..`, `\` or `:`. Anything else is treated as unsafe and not loaded. |
 | `format` | `ttf`, `otf`, or `ttc` (covers `.otc` too) |
-| `faces` | One entry per face. Collections list several, each with its `index`. |
-| `enabled` | `false` hides the font from apps but keeps it in the vault. |
-| `apps` | Apps that may load the font. Omitted or empty means all apps. |
-| `tags`, `license`, `source` | Optional; left out when empty. |
-| `added_at` | Import time, in Unix seconds |
+| `faces` | One entry per face, with its `index` in the file. Collections list several. |
+| `faces[].enabled` | `false` hides that face from apps; the other faces of a collection stay available. Defaults to `true`. |
+| `enabled` | `false` hides the whole file, whatever its faces say. A file whose faces are all disabled is hidden too. Defaults to `true`. |
+| `apps` | App ids that may load the font. Omitted or empty means all apps. |
+| `license` | An SPDX license expression as a string (`"OFL-1.1"`). A license without an SPDX identifier is wrapped in an object: `{"custom": "Licensed to Acme for internal use"}`. |
+| `tags`, `source` | Optional; left out when empty. |
+| `added_at` | Import time, as an RFC 3339 date-time |
 
-Writes are atomic: FontCore writes a temporary file and renames it into place, so apps never read a half-written manifest. A lock file serializes writers; a lock left behind by a crashed process is treated as stale after 30 seconds. A build refuses to load a manifest whose `schema_version` is newer than it supports, rather than misreading it.
+### Rules
+
+- **App ids** are lowercase reverse-DNS with at least three labels, such as `ai.storytold.photocraft`, `ai.storytold.wordcraft` or `ai.storytold.pdfcraft`. Each label is 1–63 characters of `a-z`, `0-9` and `-`, and doesn't start or end with `-`. Ids are compared exactly. A manifest containing an invalid id fails to load.
+- **Timestamps** are strict RFC 3339. `T` and `Z` must be uppercase, and a `Z` or `±HH:MM` offset is required. Fractional seconds are allowed. FontCore writes whole seconds in UTC, like `2026-10-22T02:30:00Z`, and keeps timestamps written by other tools exactly as they were.
+- **Licenses** in string form are meant to be SPDX expressions. A manifest still loads if a string isn't one this build recognizes, such as an identifier added to SPDX later. `License::is_recognized` and `License::is_open_source` let tools check.
+- **Unknown fields are preserved.** Every object (the manifest, each font, each face, and a custom license) may carry fields this schema doesn't list. Readers ignore them, and FontCore writes them back unchanged when it rewrites the file. Name your fields after your app id, e.g. `"ai.storytold.photocraft:pinned": true`, so they cannot collide with fields added to v1 later.
+- **Versioning:** adding optional fields keeps `schema_version: 1`. A change that existing readers would misread needs a new version. Readers refuse versions newer than they know rather than guess.
+
+Writes are atomic: FontCore writes a temporary file and renames it into place, so apps never read a half-written manifest. A lock file serializes writers; a lock left behind by a crashed process is treated as stale after 30 seconds.
 
 ## Development
 

@@ -3,13 +3,16 @@ use std::fs::{self, OpenOptions};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
+use serde_json::Map;
 use sha2::{Digest, Sha256};
 
 use crate::error::IoContext;
 use crate::manifest::write_atomic;
-use crate::{inspect, Error, FontEntry, Manifest, Result, MANIFEST_FILE};
+use crate::{
+    inspect, AppId, Error, FontEntry, License, Manifest, Result, Timestamp, MANIFEST_FILE,
+};
 
 /// Environment variable that overrides the default vault location.
 pub const HOME_ENV: &str = "FONTCORE_HOME";
@@ -30,9 +33,9 @@ pub struct Vault {
 /// Metadata attached to fonts on import.
 #[derive(Debug, Clone, Default)]
 pub struct AddOptions {
-    pub apps: Vec<String>,
+    pub apps: Vec<AppId>,
     pub tags: Vec<String>,
-    pub license: Option<String>,
+    pub license: Option<License>,
 }
 
 #[derive(Debug, Clone)]
@@ -162,11 +165,12 @@ impl Vault {
                 size: data.len() as u64,
                 faces,
                 enabled: true,
-                apps: options.apps.clone(),
+                apps: dedup(options.apps.clone()),
                 tags: options.tags.clone(),
                 license: options.license.clone(),
                 source: path.file_name().map(|n| n.to_string_lossy().into_owned()),
-                added_at: now(),
+                added_at: Timestamp::now(),
+                extra: Map::new(),
             };
             manifest.fonts.push(entry.clone());
             Ok(AddOutcome::Added(entry))
@@ -193,8 +197,26 @@ impl Vault {
     }
 
     /// Restricts a font to the given apps; an empty list makes it global.
-    pub fn set_apps(&self, query: &str, apps: Vec<String>) -> Result<FontEntry> {
-        self.modify(query, |entry| entry.apps = apps)
+    pub fn set_apps(&self, query: &str, apps: Vec<AppId>) -> Result<FontEntry> {
+        self.modify(query, |entry| entry.apps = dedup(apps))
+    }
+
+    /// Enables or disables one face of a font, by its collection index.
+    pub fn set_face_enabled(&self, query: &str, index: u32, enabled: bool) -> Result<FontEntry> {
+        self.update(|manifest| {
+            let i = manifest.find(query)?;
+            let entry = &mut manifest.fonts[i];
+            let face = entry
+                .faces
+                .iter_mut()
+                .find(|f| f.index == index)
+                .ok_or_else(|| Error::NoSuchFace {
+                    id: entry.id.clone(),
+                    index,
+                })?;
+            face.enabled = enabled;
+            Ok(entry.clone())
+        })
     }
 
     /// Checks that every entry's file exists and matches its hash, and that
@@ -299,10 +321,12 @@ fn is_stale(path: &Path) -> bool {
         .is_some_and(|age| age > LOCK_STALE_AFTER)
 }
 
-fn now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
+/// Drops repeated app ids, keeping the first occurrence of each.
+fn dedup(apps: Vec<AppId>) -> Vec<AppId> {
+    let mut seen = HashSet::new();
+    apps.into_iter()
+        .filter(|a| seen.insert(a.clone()))
+        .collect()
 }
 
 fn hex(bytes: &[u8]) -> String {

@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use fontcore::{AddOptions, AddOutcome, FontEntry, Vault};
+use fontcore::{AddOptions, AddOutcome, AppId, FontEntry, License, Vault};
 
 /// Manage the FontCore font vault shared by the storytold (ArtCraft) suite.
 #[derive(Parser)]
@@ -27,13 +27,13 @@ enum Command {
     Add {
         #[arg(required = true)]
         paths: Vec<PathBuf>,
-        /// Only expose the font to this app (repeatable)
-        #[arg(long = "app")]
-        apps: Vec<String>,
+        /// Only expose the font to this app, e.g. ai.storytold.photocraft (repeatable)
+        #[arg(long = "app", value_name = "APP_ID")]
+        apps: Vec<AppId>,
         /// Attach a tag (repeatable)
         #[arg(long = "tag")]
         tags: Vec<String>,
-        /// License identifier, e.g. OFL-1.1
+        /// SPDX license expression, e.g. OFL-1.1; other text is stored as a custom license
         #[arg(long)]
         license: Option<String>,
     },
@@ -41,20 +41,34 @@ enum Command {
     Remove { id: String },
     /// List fonts in the vault
     List {
-        /// Only fonts that this app would load
-        #[arg(long)]
-        app: Option<String>,
+        /// Only fonts that this app would load, e.g. ai.storytold.wordcraft
+        #[arg(long, value_name = "APP_ID")]
+        app: Option<AppId>,
         #[arg(long)]
         json: bool,
     },
     /// Show the full manifest entry for a font
     Info { id: String },
-    /// Let apps load a font again
-    Enable { id: String },
-    /// Keep a font in the vault but hide it from apps
-    Disable { id: String },
+    /// Let apps load a font, or one face of a collection, again
+    Enable {
+        id: String,
+        /// Only this face (its collection index)
+        #[arg(long)]
+        face: Option<u32>,
+    },
+    /// Keep a font, or one face of a collection, in the vault but hide it from apps
+    Disable {
+        id: String,
+        /// Only this face (its collection index)
+        #[arg(long)]
+        face: Option<u32>,
+    },
     /// Restrict a font to specific apps; pass none to make it global
-    Scope { id: String, apps: Vec<String> },
+    Scope {
+        id: String,
+        #[arg(value_name = "APP_ID")]
+        apps: Vec<AppId>,
+    },
     /// Check files against the manifest
     Verify,
 }
@@ -91,7 +105,7 @@ fn run(cli: Cli) -> fontcore::Result<ExitCode> {
             let options = AddOptions {
                 apps,
                 tags,
-                license,
+                license: license.as_deref().and_then(parse_license),
             };
             let mut failed = false;
             for path in collect_fonts(&paths, &mut failed) {
@@ -140,12 +154,12 @@ fn run(cli: Cli) -> fontcore::Result<ExitCode> {
                 serde_json::to_string_pretty(&e).expect("serializable")
             );
         }
-        Command::Enable { id } => {
-            let e = Vault::open(root)?.set_enabled(&id, true)?;
+        Command::Enable { id, face } => {
+            let e = set_enabled(&Vault::open(root)?, &id, face, true)?;
             println!("enabled  {}  {}", e.id, describe(&e));
         }
-        Command::Disable { id } => {
-            let e = Vault::open(root)?.set_enabled(&id, false)?;
+        Command::Disable { id, face } => {
+            let e = set_enabled(&Vault::open(root)?, &id, face, false)?;
             println!("disabled {}  {}", e.id, describe(&e));
         }
         Command::Scope { id, apps } => {
@@ -209,6 +223,42 @@ fn has_font_extension(path: &Path) -> bool {
     })
 }
 
+fn set_enabled(
+    vault: &Vault,
+    id: &str,
+    face: Option<u32>,
+    enabled: bool,
+) -> fontcore::Result<FontEntry> {
+    match face {
+        Some(index) => vault.set_face_enabled(id, index, enabled),
+        None => vault.set_enabled(id, enabled),
+    }
+}
+
+/// Classifies `--license` input, warning when it is not a recognized SPDX
+/// expression or not an open-source license.
+fn parse_license(input: &str) -> Option<License> {
+    let license = License::parse(input)?;
+    match &license {
+        License::Custom(_) => eprintln!(
+            "warning: '{license}' is not a recognized SPDX license identifier; storing it as custom license text"
+        ),
+        License::Spdx(_) if !license.is_open_source() => {
+            eprintln!("warning: '{license}' is not an OSI-approved or FSF free/libre license")
+        }
+        License::Spdx(_) => {}
+    }
+    Some(license)
+}
+
+fn state(e: &FontEntry) -> &'static str {
+    match e.active_faces().count() {
+        0 => "off",
+        n if n == e.faces.len() => "on",
+        _ => "partial",
+    }
+}
+
 fn describe(e: &FontEntry) -> String {
     match e.faces.as_slice() {
         [face] => format!("{} {}", face.family, face.subfamily),
@@ -220,7 +270,8 @@ fn apps_label(e: &FontEntry) -> String {
     if e.apps.is_empty() {
         "all".into()
     } else {
-        e.apps.join(",")
+        let ids: Vec<&str> = e.apps.iter().map(AppId::as_str).collect();
+        ids.join(",")
     }
 }
 
@@ -236,7 +287,7 @@ fn format_table(fonts: &[FontEntry]) -> String {
                 describe(e),
                 e.format.extension().into(),
                 apps_label(e),
-                if e.enabled { "on" } else { "off" }.into(),
+                state(e).into(),
             ]
         })
         .collect();

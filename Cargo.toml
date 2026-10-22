@@ -19,3 +19,5 @@ sha2 = "0.10"
 directories = "5"
 clap = { version = "4", features = ["derive"] }
 tempfile = "3"
+spdx = "0.13"
+jsonschema = { version = "0.59", default-features = false }

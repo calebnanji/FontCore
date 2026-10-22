@@ -1,11 +1,12 @@
 use std::fs;
 use std::io::Write;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 
 use crate::error::IoContext;
-use crate::{Error, FaceInfo, FontFormat, Result};
+use crate::{AppId, Error, FaceInfo, FontFormat, License, Result, Timestamp};
 
 /// File name of the manifest at the root of a vault.
 pub const MANIFEST_FILE: &str = "fonts.json";
@@ -14,11 +15,16 @@ pub const MANIFEST_FILE: &str = "fonts.json";
 pub const SCHEMA_VERSION: u32 = 1;
 
 /// The `fonts.json` document: the single source of truth for a vault.
+///
+/// Every object in the manifest keeps fields this build does not know about
+/// in an `extra` map and writes them back unchanged, so newer tools can add
+/// fields without older ones deleting them.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Manifest {
     pub schema_version: u32,
-    #[serde(default)]
     pub fonts: Vec<FontEntry>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 /// One font file stored in the vault.
@@ -31,25 +37,28 @@ pub struct FontEntry {
     pub format: FontFormat,
     pub sha256: String,
     pub size: u64,
+    /// Every face in the file; collections have more than one.
     pub faces: Vec<FaceInfo>,
-    #[serde(default = "default_enabled")]
+    /// `false` hides the whole file from apps, whatever its faces say.
+    #[serde(default = "default_true")]
     pub enabled: bool,
     /// Suite apps allowed to load this font. Empty means every app.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub apps: Vec<String>,
+    pub apps: Vec<AppId>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
-    /// License identifier or note, e.g. `OFL-1.1`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub license: Option<String>,
+    pub license: Option<License>,
     /// Original file name the font was imported from.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
-    /// Import time in seconds since the Unix epoch.
-    pub added_at: u64,
+    pub added_at: Timestamp,
+    /// Fields this build does not know about, preserved on rewrite.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
-fn default_enabled() -> bool {
+pub(crate) fn default_true() -> bool {
     true
 }
 
@@ -59,19 +68,34 @@ impl FontEntry {
         self.faces.first().map_or("", |f| f.family.as_str())
     }
 
-    /// Whether `app` should load this font at launch.
-    pub fn available_to(&self, app: &str) -> bool {
-        self.enabled
-            && (self.apps.is_empty() || self.apps.iter().any(|a| a.eq_ignore_ascii_case(app)))
+    /// Faces apps may load: none if the entry is disabled, otherwise the
+    /// enabled faces.
+    pub fn active_faces(&self) -> impl Iterator<Item = &FaceInfo> {
+        self.faces.iter().filter(|f| self.enabled && f.enabled)
     }
 
-    /// Resolves [`FontEntry::file`] under `root`, rejecting absolute paths and
-    /// `..` so a hand-edited manifest cannot point outside the vault.
+    /// Whether `app` should load this font at launch.
+    pub fn available_to(&self, app: &AppId) -> bool {
+        self.active_faces().next().is_some() && (self.apps.is_empty() || self.apps.contains(app))
+    }
+
+    /// Resolves [`FontEntry::file`] under `root`. Returns `None` unless the
+    /// path is `/`-separated, non-empty segments with no `.`, `..`, `\` or
+    /// `:`, so a hand-edited manifest cannot point outside the vault on any
+    /// platform.
     pub fn path_in(&self, root: &Path) -> Option<PathBuf> {
-        let rel = Path::new(&self.file);
-        let safe =
-            !self.file.is_empty() && rel.components().all(|c| matches!(c, Component::Normal(_)));
-        safe.then(|| root.join(rel))
+        let mut path = root.to_owned();
+        for segment in self.file.split('/') {
+            if segment.is_empty()
+                || segment == "."
+                || segment == ".."
+                || segment.contains(['\\', ':'])
+            {
+                return None;
+            }
+            path.push(segment);
+        }
+        Some(path)
     }
 }
 
@@ -80,6 +104,7 @@ impl Default for Manifest {
         Self {
             schema_version: SCHEMA_VERSION,
             fonts: Vec::new(),
+            extra: Map::new(),
         }
     }
 }
@@ -87,17 +112,33 @@ impl Default for Manifest {
 impl Manifest {
     pub fn load(path: &Path) -> Result<Self> {
         let text = fs::read_to_string(path).at(path)?;
-        let manifest: Self = serde_json::from_str(&text).map_err(|source| Error::Manifest {
+        Self::parse(&text, path)
+    }
+
+    /// Parses manifest text, rejecting schema versions newer than this build.
+    pub fn from_json(text: &str) -> Result<Self> {
+        Self::parse(text, Path::new(MANIFEST_FILE))
+    }
+
+    fn parse(text: &str, path: &Path) -> Result<Self> {
+        let manifest_error = |source| Error::Manifest {
             path: path.to_owned(),
             source,
-        })?;
-        if manifest.schema_version > SCHEMA_VERSION {
+        };
+        // Check the version before the full parse so a newer manifest gets a
+        // clear error instead of a field-level one.
+        #[derive(Deserialize)]
+        struct Version {
+            schema_version: u32,
+        }
+        let Version { schema_version } = serde_json::from_str(text).map_err(manifest_error)?;
+        if schema_version > SCHEMA_VERSION {
             return Err(Error::UnsupportedSchema {
-                found: manifest.schema_version,
+                found: schema_version,
                 supported: SCHEMA_VERSION,
             });
         }
-        Ok(manifest)
+        serde_json::from_str(text).map_err(manifest_error)
     }
 
     /// Writes the manifest atomically so readers never see a partial file.
