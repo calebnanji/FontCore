@@ -404,6 +404,39 @@ fn verify_finds_problems() {
 }
 
 #[test]
+fn init_waits_for_a_writer_and_keeps_its_manifest() {
+    // Another process is creating the vault: it holds the lock while it writes a manifest with a
+    // font in it. An init that starts meanwhile must wait, then leave that manifest alone.
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().join("vault");
+    fs::create_dir_all(&root).unwrap();
+    let holder = fs::File::create(root.join(".fontcore.lock")).unwrap();
+    holder.lock().unwrap();
+    let writer_root = root.clone();
+    let writer = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let mut manifest = Manifest::default();
+        manifest
+            .extra
+            .insert("written-by".into(), "other writer".into());
+        manifest.save(&writer_root.join("fonts.json")).unwrap();
+        drop(holder);
+    });
+    let started = std::time::Instant::now();
+    let vault = Vault::init(&root).unwrap();
+    // Without the lock, init would have checked and written straight away, before the writer.
+    assert!(
+        started.elapsed() >= std::time::Duration::from_millis(250),
+        "init did not wait for the lock"
+    );
+    writer.join().unwrap();
+    assert_eq!(
+        vault.manifest().unwrap().extra["written-by"],
+        "other writer"
+    );
+}
+
+#[test]
 fn a_lock_file_nobody_holds_does_not_block() {
     // What a crashed writer leaves behind: the file, but no lock on it.
     let (tmp, vault) = setup();

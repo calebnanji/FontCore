@@ -45,6 +45,7 @@ pub enum AddOutcome {
 }
 
 impl AddOutcome {
+    /// The manifest entry for the font, whether it was just added or already there.
     pub fn entry(&self) -> &FontEntry {
         match self {
             Self::Added(e) | Self::AlreadyPresent(e) => e,
@@ -117,20 +118,26 @@ impl Vault {
         let fonts = vault.root.join(FONTS_DIR);
         fs::create_dir_all(&fonts).at(&fonts)?;
         let manifest = vault.manifest_path();
+        // Check and create under the lock: otherwise a concurrent init could find no manifest,
+        // wait while another writer creates one and adds a font, then save an empty one over it.
+        let _lock = vault.lock()?;
         if !manifest.exists() {
             Manifest::default().save(&manifest)?;
         }
         Ok(vault)
     }
 
+    /// The vault's directory.
     pub fn root(&self) -> &Path {
         &self.root
     }
 
+    /// Where the vault's `fonts.json` lives.
     pub fn manifest_path(&self) -> PathBuf {
         self.root.join(MANIFEST_FILE)
     }
 
+    /// Reads the current manifest. Takes no lock: writes are atomic, so it is never half-written.
     pub fn manifest(&self) -> Result<Manifest> {
         Manifest::load(&self.manifest_path())
     }
@@ -196,6 +203,7 @@ impl Vault {
         })
     }
 
+    /// Shows or hides a whole font file from apps; its faces keep their own flags.
     pub fn set_enabled(&self, query: &str, enabled: bool) -> Result<FontEntry> {
         self.modify(query, |entry| entry.enabled = enabled)
     }

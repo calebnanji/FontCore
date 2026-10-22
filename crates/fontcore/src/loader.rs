@@ -27,6 +27,7 @@ impl ResolvedFont {
         self.entry.active_faces()
     }
 
+    /// Reads the font file's bytes from the vault.
     pub fn read(&self) -> Result<Vec<u8>> {
         fs::read(&self.path).at(&self.path)
     }

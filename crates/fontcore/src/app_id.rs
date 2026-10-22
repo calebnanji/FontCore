@@ -16,6 +16,7 @@ use crate::{Error, Result};
 pub struct AppId(String);
 
 impl AppId {
+    /// Validates `id`, returning [`Error::InvalidAppId`] if it is not lowercase reverse-DNS.
     pub fn new(id: impl Into<String>) -> Result<Self> {
         let id = id.into();
         if is_valid(&id) {
@@ -25,6 +26,7 @@ impl AppId {
         }
     }
 
+    /// The id as written, e.g. `ai.storytold.photocraft`.
     pub fn as_str(&self) -> &str {
         &self.0
     }
